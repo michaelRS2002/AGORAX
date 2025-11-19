@@ -1,5 +1,7 @@
 import express, { Request, Response } from 'express';
 import bcrypt from 'bcryptjs';
+import * as jwt from 'jsonwebtoken';
+import { admin } from '../config/database';
 import { createUser } from '../dao/userDAO';
 import { UserModel } from '../models/users';
 import GlobalDAO from '../dao/globalDAO';
@@ -13,10 +15,11 @@ const userDao = new GlobalDAO('users', 'id');
 // POST /auth/register
 router.post('/register', async (req: Request, res: Response) => {
   try {
-    const { name, email, age, password } = req.body;
+    const { name, email, age, password, firebaseUid, photoURL } = req.body;
 
-    if (!name || !email || !age || !password) {
-      return res.status(400).json({ error: 'name, email, age and password are required' });
+    // Require name, email, age and at least one of password or firebaseUid
+    if (!name || !email || !age || (!password && !firebaseUid)) {
+      return res.status(400).json({ error: 'name, email, age and password or firebaseUid are required' });
     }
 
     // Basic validation
@@ -30,14 +33,16 @@ router.post('/register', async (req: Request, res: Response) => {
       return res.status(409).json({ success: false, message: 'Email already registered' });
     }
 
-    // Hash password
-    const hashed = await bcrypt.hash(password, 10);
+    // Hash password if provided
+    const hashed = password ? await bcrypt.hash(password, 10) : undefined;
 
     const user: UserModel = {
       name,
       email,
       age,
-      password: hashed,
+      password: hashed ?? null,
+      firebaseUid: firebaseUid || undefined,
+      photoURL: photoURL || undefined,
     };
 
     const created = await createUser(user);
@@ -46,6 +51,88 @@ router.post('/register', async (req: Request, res: Response) => {
   } catch (err: any) {
     console.error('Register error:', err);
     return res.status(500).json({ error: err.message || 'internal error' });
+  }
+});
+
+// POST /auth/login
+router.post('/login', async (req: Request, res: Response) => {
+  try {
+    const { email, password, idToken } = req.body;
+
+    // Support two login flows:
+    // 1) email + password (local password stored in Firestore)
+    // 2) idToken (Firebase client idToken): verify token and trust Firebase auth
+
+    if (idToken) {
+      // Verify Firebase idToken
+      let decoded: any;
+      try {
+        decoded = await admin.auth().verifyIdToken(idToken);
+      } catch (e) {
+        return res.status(401).json({ success: false, message: 'Invalid Firebase idToken' });
+      }
+
+      const uid = decoded.uid;
+      const userByUid: any = await userDao.findOneBy({ firebaseUid: uid });
+      if (!userByUid) {
+        // Optionally create a user record if not found
+        const emailFromToken = decoded.email;
+        const nameFromToken = decoded.name || '';
+        const photoFromToken = decoded.picture || undefined;
+        const created = await createUser({
+          name: nameFromToken || emailFromToken || 'Firebase User',
+          email: emailFromToken,
+          age: 0,
+          password: null,
+          firebaseUid: uid,
+          photoURL: photoFromToken,
+        } as any);
+        const payload = { id: created.id, email: created.email };
+        const token = (jwt as any).sign(payload, process.env.JWT_SECRET as any || 'change_this_secret', { expiresIn: process.env.JWT_EXPIRES || '1h' });
+        const safeUser = { ...created } as any;
+        delete safeUser.password;
+        delete safeUser.resetPasswordToken;
+        delete safeUser.resetPasswordExpires;
+        return res.status(200).json({ success: true, token, user: safeUser });
+      }
+
+      const payload = { id: userByUid.id, email: userByUid.email };
+      const token = (jwt as any).sign(payload, process.env.JWT_SECRET as any || 'change_this_secret', { expiresIn: process.env.JWT_EXPIRES || '1h' });
+      const safeUser = { ...userByUid } as any;
+      delete safeUser.password;
+      delete safeUser.resetPasswordToken;
+      delete safeUser.resetPasswordExpires;
+      return res.status(200).json({ success: true, token, user: safeUser });
+    }
+
+    // Fallback: email + password
+    if (!email || !password) return res.status(400).json({ success: false, message: 'email and password are required' });
+
+    const user: any = await userDao.findOneBy({ email });
+    if (!user) return res.status(401).json({ success: false, message: 'Invalid credentials' });
+
+    // If user has no local password (managed by Firebase), reject and instruct client to use idToken flow
+    if (!user.password && user.firebaseUid) {
+      return res.status(400).json({ success: false, message: 'Use Firebase sign-in (send idToken) for this account' });
+    }
+
+    const match = await bcrypt.compare(password, user.password || '');
+    if (!match) return res.status(401).json({ success: false, message: 'Invalid credentials' });
+
+    const payload = { id: user.id, email: user.email };
+    const secret = process.env.JWT_SECRET || 'change_this_secret';
+    const token = (jwt as any).sign(payload, secret as any, { expiresIn: process.env.JWT_EXPIRES || '1h' });
+
+    // remove sensitive fields
+    const safeUser = { ...user };
+    delete safeUser.password;
+    delete safeUser.resetPasswordToken;
+    delete safeUser.resetPasswordExpires;
+
+    return res.status(200).json({ success: true, token, user: safeUser });
+  } catch (err: any) {
+    console.error('Login error:', err);
+    return res.status(500).json({ success: false, message: err.message || 'internal error' });
   }
 });
 
@@ -98,15 +185,31 @@ router.post('/reset-password', async (req: Request, res: Response) => {
       return res.status(400).json({ success: false, message: 'Token inválido o expirado' });
     }
 
-    // Hash nueva contraseña
+    // Hash nueva contraseña or update in Firebase if user is managed there
     const hashed = await bcrypt.hash(newPassword, 10);
 
-    // Actualizar contraseña y limpiar token
-    const updated = await userDao.update(user.id, {
-      password: hashed,
-      resetPasswordToken: null,
-      resetPasswordExpires: null,
-    });
+    let updated: any = null;
+    if (user.firebaseUid) {
+      // Update password in Firebase Auth
+      try {
+        await admin.auth().updateUser(user.firebaseUid, { password: newPassword });
+      } catch (e) {
+        console.error('Error updating Firebase user password:', e);
+        return res.status(500).json({ success: false, message: 'Error updating Firebase password' });
+      }
+      // Clear reset fields in Firestore user document
+      updated = await userDao.update(user.id, {
+        resetPasswordToken: null,
+        resetPasswordExpires: null,
+      });
+    } else {
+      // Local password: update in Firestore document
+      updated = await userDao.update(user.id, {
+        password: hashed,
+        resetPasswordToken: null,
+        resetPasswordExpires: null,
+      });
+    }
 
     return res.status(200).json({ success: true, message: 'Contraseña actualizada correctamente', user: updated });
   } catch (err: any) {

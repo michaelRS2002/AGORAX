@@ -68,8 +68,9 @@ router.post('/login', async (req: Request, res: Response) => {
       let decoded: any;
       try {
         decoded = await admin.auth().verifyIdToken(idToken);
-      } catch (e) {
-        return res.status(401).json({ success: false, message: 'Invalid Firebase idToken' });
+      } catch (e: any) {
+        console.error('verifyIdToken error:', e && e.message ? e.message : e);
+        return res.status(401).json({ success: false, message: 'Invalid Firebase idToken', detail: e?.message });
       }
 
       const uid = decoded.uid;
